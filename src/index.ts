@@ -6,7 +6,7 @@ import { maskSecrets } from './errors.js';
 import { OverleafHttpClient } from './overleaf/http-client.js';
 import { OverleafRealtimeClient } from './overleaf/socket09-client.js';
 import { OverleafService } from './overleaf/service.js';
-import { createMcpServer } from './server.js';
+import { attachShutdownHandlers, createMcpServer } from './server.js';
 
 async function main(): Promise<void> {
   const config = await loadConfig();
@@ -19,18 +19,16 @@ async function main(): Promise<void> {
   const server = createMcpServer(service, [config.password]);
   const transport = new StdioServerTransport();
 
-  const shutdown = async () => {
-    realtimeClient.close();
-    await server.close();
-    process.exit(0);
+  const shutdown = attachShutdownHandlers({
+    stdin: process.stdin,
+    proc: process,
+    onClose: () => realtimeClient.close(),
+    closeServer: () => server.close(),
+    exit: (code) => process.exit(code),
+  });
+  server.onclose = () => {
+    void shutdown();
   };
-
-  process.on('SIGINT', () => {
-    void shutdown();
-  });
-  process.on('SIGTERM', () => {
-    void shutdown();
-  });
 
   await server.connect(transport);
   console.error(`[overleaf-ce-mcp] Running on stdio for ${config.url}`);

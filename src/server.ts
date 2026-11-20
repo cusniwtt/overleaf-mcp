@@ -371,3 +371,44 @@ export function createMcpServer(
 
   return server;
 }
+
+export interface ShutdownHandlersOptions {
+  stdin: NodeJS.EventEmitter;
+  proc: NodeJS.EventEmitter;
+  onClose: () => void;
+  closeServer: () => Promise<void>;
+  exit: (code: number) => void;
+}
+
+/**
+ * Registers idempotent shutdown listeners on signals and stdin EOF so open
+ * WebSockets cannot keep the stdio MCP process alive after client disconnect.
+ */
+export function attachShutdownHandlers(opts: ShutdownHandlersOptions): () => Promise<void> {
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      opts.onClose();
+      await opts.closeServer();
+    } finally {
+      opts.exit(0);
+    }
+  };
+
+  opts.proc.once('SIGINT', () => {
+    void shutdown();
+  });
+  opts.proc.once('SIGTERM', () => {
+    void shutdown();
+  });
+  opts.stdin.once('end', () => {
+    void shutdown();
+  });
+  opts.stdin.once('close', () => {
+    void shutdown();
+  });
+
+  return shutdown;
+}

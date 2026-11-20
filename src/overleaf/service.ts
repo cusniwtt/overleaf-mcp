@@ -269,11 +269,10 @@ export class OverleafService {
         };
       }
 
-      await this.realtimeClient.applyOtUpdate(project.id, entity.id, {
+      const toVersion = await this.realtimeClient.applyOtUpdate(project.id, entity.id, {
         v: live.version,
         op: ops,
       });
-      const toVersion = live.version + 1;
       this.lastReadVersion.set(key, toVersion);
       return {
         filePath: entity.path,
@@ -313,60 +312,67 @@ export class OverleafService {
     project?: string;
   }): Promise<{ filePath: string; docId: string; createdFolders: string[] }> {
     const normalized = normalizeProjectPath(input.filePath);
-    const { project, tree } = await this.getProjectTree(input.project);
+    const project = await this.resolveProject(input.project);
 
-    if (tree.entities.some((e) => e.path === normalized)) {
-      throw new OverleafMcpError(
-        `File "${normalized}" already exists in project.`,
-        'FILE_EXISTS'
-      );
-    }
+    return this.enqueue(`project:${project.id}`, async () => {
+      const payload = await this.realtimeClient.joinProject(project.id);
+      const tree = flattenProjectTree(payload.rootFolder);
 
-    const parts = normalized.split('/');
-    const fileName = parts.pop()!;
-    let parentFolderId = tree.rootFolderId;
-    const createdFolders: string[] = [];
-    let currentPath = '';
-
-    for (const segment of parts) {
-      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
-      const existingId = tree.foldersByPath.get(currentPath);
-      if (existingId) {
-        parentFolderId = existingId;
-      } else {
-        const created = await this.httpClient.createFolder(project.id, segment, parentFolderId);
-        tree.foldersByPath.set(currentPath, created._id);
-        parentFolderId = created._id;
-        createdFolders.push(currentPath);
+      if (tree.entities.some((e) => e.path === normalized)) {
+        throw new OverleafMcpError(
+          `File "${normalized}" already exists in project.`,
+          'FILE_EXISTS'
+        );
       }
-    }
 
-    const createdDoc = await this.httpClient.createDoc(project.id, fileName, parentFolderId);
-    const key = `${project.id}:${createdDoc._id}`;
+      const parts = normalized.split('/');
+      const fileName = parts.pop()!;
+      let parentFolderId = tree.rootFolderId;
+      const createdFolders: string[] = [];
+      let currentPath = '';
 
-    if (input.content && input.content.length > 0) {
-      await this.enqueue(key, async () => {
-        const live = await this.realtimeClient.joinDoc(project.id, createdDoc._id);
-        const ops = computeOtOps(live.content, input.content!);
-        if (ops.length > 0) {
-          await this.realtimeClient.applyOtUpdate(project.id, createdDoc._id, {
-            v: live.version,
-            op: ops,
-          });
-          this.lastReadVersion.set(key, live.version + 1);
+      for (const segment of parts) {
+        currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+        const existingId = tree.foldersByPath.get(currentPath);
+        if (existingId) {
+          parentFolderId = existingId;
         } else {
-          this.lastReadVersion.set(key, live.version);
+          const created = await this.httpClient.createFolder(project.id, segment, parentFolderId);
+          tree.foldersByPath.set(currentPath, created._id);
+          this.realtimeClient.registerCreatedFolder(project.id, parentFolderId, created);
+          parentFolderId = created._id;
+          createdFolders.push(currentPath);
         }
-      });
-    } else {
-      this.lastReadVersion.set(key, 0);
-    }
+      }
 
-    return {
-      filePath: normalized,
-      docId: createdDoc._id,
-      createdFolders,
-    };
+      const createdDoc = await this.httpClient.createDoc(project.id, fileName, parentFolderId);
+      this.realtimeClient.registerCreatedDoc(project.id, parentFolderId, createdDoc);
+      const key = `${project.id}:${createdDoc._id}`;
+
+      if (input.content && input.content.length > 0) {
+        await this.enqueue(key, async () => {
+          const live = await this.realtimeClient.joinDoc(project.id, createdDoc._id);
+          const ops = computeOtOps(live.content, input.content!);
+          if (ops.length > 0) {
+            const nextVersion = await this.realtimeClient.applyOtUpdate(project.id, createdDoc._id, {
+              v: live.version,
+              op: ops,
+            });
+            this.lastReadVersion.set(key, nextVersion);
+          } else {
+            this.lastReadVersion.set(key, live.version);
+          }
+        });
+      } else {
+        this.lastReadVersion.set(key, 0);
+      }
+
+      return {
+        filePath: normalized,
+        docId: createdDoc._id,
+        createdFolders,
+      };
+    });
   }
 
   async compileProject(input: {
@@ -375,6 +381,7 @@ export class OverleafService {
   } = {}): Promise<{ status: string; errors: string[]; logExcerpt: string }> {
     const project = await this.resolveProject(input.project);
     let rootDocId: string | undefined;
+    let rootResourcePath: string | undefined;
 
     if (input.rootDocPath) {
       const payload = await this.realtimeClient.joinProject(project.id);
@@ -387,9 +394,13 @@ export class OverleafService {
         );
       }
       rootDocId = entity.id;
+      rootResourcePath = entity.path;
     }
 
-    const compiled = await this.httpClient.compileProject(project.id, { rootDocId });
+    const compiled = await this.httpClient.compileProject(project.id, {
+      rootDocId,
+      rootResourcePath,
+    });
     const { errors, logExcerpt } = extractLatexErrors(compiled.logText);
     return {
       status: compiled.status,

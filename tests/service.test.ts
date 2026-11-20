@@ -73,7 +73,10 @@ function makeFixture() {
       }
       appliedUpdates.push({ docId, v: update.v, op: update.op });
       docState = { ...docState, version: docState.version + 1 };
+      return docState.version;
     }),
+    registerCreatedFolder: vi.fn(),
+    registerCreatedDoc: vi.fn(),
   } as unknown as OverleafRealtimeClient;
 
   return {
@@ -163,8 +166,50 @@ describe('OverleafService', () => {
     expect(appliedUpdates).toHaveLength(1);
   });
 
-  it('creates only missing intermediate folders on createFile and populates content', async () => {
+  it('creates only missing intermediate folders on createFile and updates project tree for follow-up operations', async () => {
     const { httpClient, realtimeClient, createdFolders, createdDocs, appliedUpdates } = makeFixture();
+    // Simulate real OverleafRealtimeClient mutations when registerCreatedFolder/Doc are called
+    let liveTree: OverleafProjectPayload | undefined;
+    (realtimeClient.joinProject as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      if (!liveTree) {
+        liveTree = {
+          _id: 'p1',
+          name: 'Paper One',
+          rootDoc_id: 'd-main',
+          rootFolder: [
+            {
+              _id: 'root-1',
+              name: 'rootFolder',
+              docs: [{ _id: 'd-main', name: 'main.tex' }],
+              fileRefs: [{ _id: 'f-img', name: 'fig.png' }],
+              folders: [
+                {
+                  _id: 'fld-sec',
+                  name: 'sections',
+                  docs: [{ _id: 'd-intro', name: 'intro.tex' }],
+                  fileRefs: [],
+                  folders: [],
+                },
+              ],
+            },
+          ],
+        };
+      }
+      return liveTree;
+    });
+    (realtimeClient as unknown as { registerCreatedFolder: ReturnType<typeof vi.fn> }).registerCreatedFolder = vi.fn(
+      (_pid: string, parentId: string, folder: { _id: string; name: string }) => {
+        const sec = liveTree!.rootFolder[0].folders!.find((f) => f._id === parentId);
+        sec?.folders?.push({ ...folder, docs: [], fileRefs: [], folders: [] });
+      }
+    );
+    (realtimeClient as unknown as { registerCreatedDoc: ReturnType<typeof vi.fn> }).registerCreatedDoc = vi.fn(
+      (_pid: string, parentId: string, doc: { _id: string; name: string }) => {
+        const ch1 = liveTree!.rootFolder[0].folders![0].folders!.find((f) => f._id === parentId);
+        ch1?.docs?.push(doc);
+      }
+    );
+
     const svc = new OverleafService(httpClient, realtimeClient, { defaultProject: 'p1' });
 
     const res = await svc.createFile({
@@ -180,13 +225,21 @@ describe('OverleafService', () => {
       createdFolders: ['sections/ch1'],
     });
     expect(appliedUpdates).toHaveLength(1);
+
+    const files = await svc.listFiles();
+    expect(files.files.some((f) => f.path === 'sections/ch1/new.tex')).toBe(true);
+    await expect(svc.createFile({ filePath: 'sections/ch1/new.tex' })).rejects.toThrow(/already exists/i);
   });
 
-  it('extracts LaTeX errors and log excerpt in compileProject', async () => {
+  it('forwards both rootDocId and rootResourcePath in compileProject and extracts errors', async () => {
     const { httpClient, realtimeClient } = makeFixture();
     const svc = new OverleafService(httpClient, realtimeClient, { defaultProject: 'p1' });
 
-    const res = await svc.compileProject({ rootDocPath: 'main.tex' });
+    const res = await svc.compileProject({ rootDocPath: 'sections/intro.tex' });
+    expect(httpClient.compileProject).toHaveBeenCalledWith('p1', {
+      rootDocId: 'd-intro',
+      rootResourcePath: 'sections/intro.tex',
+    });
     expect(res.status).toBe('failure');
     expect(res.errors[0]).toContain('! Undefined control sequence.');
     expect(res.logExcerpt).toContain('! Undefined control sequence.');
@@ -205,7 +258,9 @@ describe('OverleafService', () => {
       async (_pid: string, docId: string, update: { v: number; op: unknown[] }) => {
         order.push(`apply-${update.v}`);
         appliedUpdates.push({ docId, v: update.v, op: update.op });
-        setDocState({ version: update.v + 1 });
+        const nextV = update.v + 1;
+        setDocState({ version: nextV });
+        return nextV;
       }
     );
 

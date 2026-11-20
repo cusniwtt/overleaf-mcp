@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { createMcpServer } from '../src/server.js';
+import { attachShutdownHandlers, createMcpServer } from '../src/server.js';
 import type { OverleafService } from '../src/overleaf/service.js';
 
 function makeMockService(): OverleafService {
@@ -147,5 +148,29 @@ describe('MCP server', () => {
 
     await client.close();
     await server.close();
+  });
+
+  it('closes realtime sockets, MCP server, and exits once on stdin end/close', async () => {
+    const fakeStdin = new EventEmitter() as unknown as NodeJS.ReadStream;
+    const fakeProc = new EventEmitter() as unknown as NodeJS.Process;
+    const closeRealtime = vi.fn();
+    const closeServer = vi.fn(async () => {});
+    const exitFn = vi.fn();
+
+    attachShutdownHandlers({
+      stdin: fakeStdin,
+      proc: fakeProc,
+      onClose: closeRealtime,
+      closeServer,
+      exit: exitFn,
+    });
+
+    (fakeStdin as unknown as EventEmitter).emit('end');
+    (fakeStdin as unknown as EventEmitter).emit('close');
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(closeRealtime).toHaveBeenCalledTimes(1);
+    expect(closeServer).toHaveBeenCalledTimes(1);
+    expect(exitFn).toHaveBeenCalledWith(0);
   });
 });

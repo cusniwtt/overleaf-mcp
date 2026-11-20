@@ -21,8 +21,22 @@ const SECTION_LEVELS: Record<LatexSectionType, number> = {
   subsubsection: 3,
 };
 
+function isInLineComment(content: string, pos: number): boolean {
+  const lineStart = content.lastIndexOf('\n', pos - 1) + 1;
+  for (let i = lineStart; i < pos; i++) {
+    if (content[i] === '\\') {
+      i++;
+      continue;
+    }
+    if (content[i] === '%') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Parses LaTeX sectioning commands using brace-balanced scanning.
+ * Parses LaTeX sectioning commands using brace-balanced scanning, ignoring `%`-commented headings.
  */
 export function parseSections(content: string): LatexSection[] {
   const sections: LatexSection[] = [];
@@ -31,6 +45,9 @@ export function parseSections(content: string): LatexSection[] {
 
   while ((match = openerRegex.exec(content)) !== null) {
     const startIdx = match.index;
+    if (isInLineComment(content, startIdx)) {
+      continue;
+    }
     const type = match[1] as LatexSectionType;
     let depth = 1;
     let i = openerRegex.lastIndex;
@@ -123,7 +140,8 @@ export function extractSectionContent(
 }
 
 /**
- * Replaces a LaTeX section (including its heading line) with `newContent`.
+ * Replaces a LaTeX section (including its heading line) with `newContent`,
+ * preserving surrounding blank lines and trailing newlines.
  */
 export function replaceSectionContent(
   content: string,
@@ -132,7 +150,6 @@ export function replaceSectionContent(
   sectionIndex?: number
 ): string {
   const { start, end } = findTargetSectionSpan(content, sectionTitle, sectionIndex);
-  const tail = content.slice(end);
-  const separator = tail.length > 0 ? '\n' : '';
-  return content.slice(0, start) + newContent.trimEnd() + separator + tail;
+  const trimmedEnd = start + content.slice(start, end).trimEnd().length;
+  return content.slice(0, start) + newContent.trimEnd() + content.slice(trimmedEnd);
 }

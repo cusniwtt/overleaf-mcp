@@ -194,7 +194,7 @@ describe('OverleafRealtimeClient', () => {
     client.close();
   });
 
-  it('submits applyOtUpdate and surfaces ack errors or otUpdateError', async () => {
+  it('waits for otUpdateApplied and rejects on async otUpdateError after queue ack', async () => {
     const receivedUpdates: unknown[] = [];
     const srv = await startMockServer((ws) => {
       ws.send('1::');
@@ -209,11 +209,25 @@ describe('OverleafRealtimeClient', () => {
         const pkt = decodeSocket09Packet(raw.toString());
         if (pkt.type === 5 && pkt.name === 'applyOtUpdate') {
           receivedUpdates.push(pkt.args);
-          const update = pkt.args[1] as { v: number };
+          const update = pkt.args[1] as { v: number; doc: string };
+          // Real Overleaf sends empty queue ack [null] first, then otUpdateApplied or otUpdateError
+          ws.send(`6:::${pkt.id}+[null]`);
           if (update.v === 7) {
-            ws.send(`6:::${pkt.id}+[null]`);
+            ws.send(
+              '5:::' +
+                JSON.stringify({
+                  name: 'otUpdateApplied',
+                  args: [{ v: 7, doc: update.doc }],
+                })
+            );
           } else {
-            ws.send(`6:::${pkt.id}+` + JSON.stringify([{ message: 'version mismatch' }]));
+            ws.send(
+              '5:::' +
+                JSON.stringify({
+                  name: 'otUpdateError',
+                  args: ['DeleteMismatchError', { doc_id: update.doc, error: 'DeleteMismatchError' }],
+                })
+            );
           }
         }
       });
@@ -222,12 +236,63 @@ describe('OverleafRealtimeClient', () => {
     const cfg: OverleafConfig = { url: srv.url, email: 'a@b.c', password: 'pw' };
     const client = new OverleafRealtimeClient(cfg, createMockHttpClient());
 
-    await client.applyOtUpdate('p1', 'd1', { v: 7, op: [{ p: 0, i: 'hi' }] });
+    const nextV = await client.applyOtUpdate('p1', 'd1', { v: 7, op: [{ p: 0, i: 'hi' }] });
+    expect(nextV).toBe(8);
     expect(receivedUpdates[0]).toEqual(['d1', { doc: 'd1', v: 7, op: [{ p: 0, i: 'hi' }] }]);
 
     await expect(
       client.applyOtUpdate('p1', 'd1', { v: 8, op: [{ p: 0, i: 'fail' }] })
-    ).rejects.toThrow(/version mismatch/);
+    ).rejects.toThrow(/DeleteMismatchError/);
+
+    client.close();
+  });
+
+  it('deduplicates concurrent joinProject calls and updates cached tree on Socket.IO broadcasts', async () => {
+    let socketCount = 0;
+    let activeWs: import('ws').WebSocket | undefined;
+    const srv = await startMockServer((ws) => {
+      socketCount++;
+      activeWs = ws;
+      ws.send('1::');
+      setTimeout(() => {
+        ws.send(
+          '5:::' +
+            JSON.stringify({
+              name: 'joinProjectResponse',
+              args: [
+                {
+                  publicId: 'P.1',
+                  project: {
+                    _id: 'p1',
+                    name: 'P',
+                    rootDoc_id: 'd1',
+                    rootFolder: [{ _id: 'root', name: 'rootFolder', docs: [{ _id: 'd1', name: 'main.tex' }], fileRefs: [], folders: [] }],
+                  },
+                },
+              ],
+            })
+        );
+      }, 15);
+    });
+
+    const cfg: OverleafConfig = { url: srv.url, email: 'a@b.c', password: 'pw' };
+    const client = new OverleafRealtimeClient(cfg, createMockHttpClient());
+
+    const [pA, pB] = await Promise.all([client.joinProject('p1'), client.joinProject('p1')]);
+    expect(socketCount).toBe(1);
+    expect(pA._id).toBe('p1');
+    expect(pB._id).toBe('p1');
+
+    // Emit live tree mutation broadcasts
+    activeWs!.send('5:::' + JSON.stringify({ name: 'reciveNewFolder', args: ['root', { _id: 'f1', name: 'sec' }] }));
+    activeWs!.send('5:::' + JSON.stringify({ name: 'reciveNewDoc', args: ['f1', { _id: 'd2', name: 'ch1.tex' }] }));
+    activeWs!.send('5:::' + JSON.stringify({ name: 'reciveEntityRename', args: ['d2', 'intro.tex'] }));
+    activeWs!.send('5:::' + JSON.stringify({ name: 'setRootDoc', args: ['d2'] }));
+
+    await new Promise((r) => setTimeout(r, 20));
+    const updated = await client.joinProject('p1');
+    expect(updated.rootDoc_id).toBe('d2');
+    expect(updated.rootFolder[0].folders?.[0].docs?.[0]).toEqual({ _id: 'd2', name: 'intro.tex' });
 
     client.close();
   });

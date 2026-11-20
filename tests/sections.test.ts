@@ -89,4 +89,34 @@ describe('LaTeX sections parser & replacer', () => {
     expect(() => extractSectionContent(sampleDoc, 'Nonexistent')).toThrow(OverleafMcpError);
     expect(() => replaceSectionContent(sampleDoc, 'Intro', 'x', 99999)).toThrow(OverleafMcpError);
   });
+
+  it('ignores commented-out headings and preserves blank lines and trailing newlines', () => {
+    const withCommentsAndSpacing = [
+      '\\documentclass{article}',
+      '\\begin{document}',
+      '% \\section{Intro}',
+      '\\section{Intro}',
+      'Body 100\\% valid.',
+      '',
+      '\\section{Next}',
+      'End.',
+      '\\end{document}',
+      '',
+    ].join('\n');
+
+    const sections = parseSections(withCommentsAndSpacing);
+    expect(sections.map((s) => s.title)).toEqual(['Intro', 'Next']);
+
+    const replaced = replaceSectionContent(
+      withCommentsAndSpacing,
+      'Intro',
+      '\\section{Intro}\nReplaced body.'
+    );
+    expect(replaced).toContain('\\section{Intro}\nReplaced body.\n\n\\section{Next}');
+    expect(replaced.endsWith('\n')).toBe(true);
+
+    const subfile = '\\section{Sub}\nOld line.\n';
+    const replacedSubfile = replaceSectionContent(subfile, 'Sub', '\\section{Sub}\nNew line.');
+    expect(replacedSubfile).toBe('\\section{Sub}\nNew line.\n');
+  });
 });

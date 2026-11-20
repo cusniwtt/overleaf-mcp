@@ -32,6 +32,35 @@ function extractCsrfToken(html: string): string | undefined {
   return inputMatch?.[1];
 }
 
+function applySetCookies(jar: Map<string, string>, headers: Headers): void {
+  const rawSetCookies =
+    typeof headers.getSetCookie === 'function'
+      ? headers.getSetCookie()
+      : headers.get('set-cookie')
+        ? [headers.get('set-cookie') as string]
+        : [];
+
+  for (const raw of rawSetCookies) {
+    const pair = raw.split(';', 1)[0]?.trim();
+    if (!pair) continue;
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (value === '') {
+      jar.delete(name);
+    } else {
+      jar.set(name, value);
+    }
+  }
+}
+
+function formatCookieMap(jar: Map<string, string>): string {
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
 /**
  * Authenticated HTTP client for Overleaf Community Edition web endpoints.
  */
@@ -61,33 +90,8 @@ export class OverleafHttpClient {
     return maskSecrets(text, this.secretsList());
   }
 
-  private updateCookies(headers: Headers): void {
-    const rawSetCookies =
-      typeof headers.getSetCookie === 'function'
-        ? headers.getSetCookie()
-        : headers.get('set-cookie')
-          ? [headers.get('set-cookie') as string]
-          : [];
-
-    for (const raw of rawSetCookies) {
-      const pair = raw.split(';', 1)[0]?.trim();
-      if (!pair) continue;
-      const eq = pair.indexOf('=');
-      if (eq <= 0) continue;
-      const name = pair.slice(0, eq).trim();
-      const value = pair.slice(eq + 1).trim();
-      if (value === '') {
-        this.cookies.delete(name);
-      } else {
-        this.cookies.set(name, value);
-      }
-    }
-  }
-
   getCookieHeader(): string {
-    return Array.from(this.cookies.entries())
-      .map(([k, v]) => `${k}=${v}`)
-      .join('; ');
+    return formatCookieMap(this.cookies);
   }
 
   invalidateSession(): void {
@@ -106,14 +110,27 @@ export class OverleafHttpClient {
     await this.loginPromise;
   }
 
-  private async performLogin(): Promise<void> {
+  private async reauthenticate(failedCookieHeader: string): Promise<void> {
+    if (this.loginPromise) {
+      await this.loginPromise;
+      return;
+    }
+    // Another request may already have rotated the session after we sent ours.
+    if (this.authenticated && this.getCookieHeader() !== failedCookieHeader) {
+      return;
+    }
     this.invalidateSession();
+    await this.ensureAuthenticated();
+  }
+
+  private async performLogin(): Promise<void> {
+    const stagedCookies = new Map<string, string>();
 
     const loginPageRes = await this.fetchImpl(`${this.config.url}/login`, {
       method: 'GET',
       redirect: 'manual',
     });
-    this.updateCookies(loginPageRes.headers);
+    applySetCookies(stagedCookies, loginPageRes.headers);
     const loginHtml = await loginPageRes.text();
     const loginCsrf = extractCsrfToken(loginHtml);
     if (!loginCsrf) {
@@ -122,8 +139,8 @@ export class OverleafHttpClient {
         'AUTH_ERROR'
       );
     }
-    this.csrfToken = loginCsrf;
 
+    const cookieStr = formatCookieMap(stagedCookies);
     const loginRes = await this.fetchImpl(`${this.config.url}/login`, {
       method: 'POST',
       redirect: 'manual',
@@ -131,7 +148,7 @@ export class OverleafHttpClient {
         'content-type': 'application/json',
         accept: 'application/json, text/html',
         'x-csrf-token': loginCsrf,
-        ...(this.getCookieHeader() ? { cookie: this.getCookieHeader() } : {}),
+        ...(cookieStr ? { cookie: cookieStr } : {}),
       },
       body: JSON.stringify({
         _csrf: loginCsrf,
@@ -139,7 +156,7 @@ export class OverleafHttpClient {
         password: this.config.password,
       }),
     });
-    this.updateCookies(loginRes.headers);
+    applySetCookies(stagedCookies, loginRes.headers);
 
     if (loginRes.status >= 300 && loginRes.status < 400) {
       const location = loginRes.headers.get('location') ?? '';
@@ -150,7 +167,11 @@ export class OverleafHttpClient {
         );
       }
     } else if (!loginRes.ok) {
-      const body = this.redact(await loginRes.text());
+      const body = maskSecrets(await loginRes.text(), [
+        this.config.password,
+        loginCsrf,
+        ...stagedCookies.values(),
+      ]);
       throw new OverleafMcpError(
         `Overleaf login failed with HTTP ${loginRes.status}: ${body}`,
         'AUTH_ERROR'
@@ -162,7 +183,10 @@ export class OverleafHttpClient {
           const parsed = JSON.parse(text) as { redir?: string; message?: { text?: string } | string };
           if (!parsed.redir && parsed.message) {
             const msg = typeof parsed.message === 'string' ? parsed.message : parsed.message.text ?? 'Login failed';
-            throw new OverleafMcpError(`Overleaf login failed: ${this.redact(msg)}`, 'AUTH_ERROR');
+            throw new OverleafMcpError(
+              `Overleaf login failed: ${maskSecrets(msg, [this.config.password, loginCsrf, ...stagedCookies.values()])}`,
+              'AUTH_ERROR'
+            );
           }
         } catch (err) {
           if (err instanceof OverleafMcpError) throw err;
@@ -170,26 +194,30 @@ export class OverleafHttpClient {
       }
     }
 
-    // Fetch /project to refresh the authenticated session's CSRF token
+    const authedCookieStr = formatCookieMap(stagedCookies);
     const projectPageRes = await this.fetchImpl(`${this.config.url}/project`, {
       method: 'GET',
       redirect: 'manual',
-      headers: {
-        ...(this.getCookieHeader() ? { cookie: this.getCookieHeader() } : {}),
-      },
+      headers: authedCookieStr ? { cookie: authedCookieStr } : {},
     });
-    this.updateCookies(projectPageRes.headers);
-    if (projectPageRes.status === 302 && (projectPageRes.headers.get('location') ?? '').includes('/login')) {
+    applySetCookies(stagedCookies, projectPageRes.headers);
+
+    if (!projectPageRes.ok) {
+      const location = projectPageRes.headers.get('location') ?? '';
       throw new OverleafMcpError(
-        'Overleaf session was not established after login.',
+        `Overleaf session was not established after login (status ${projectPageRes.status}${location ? `, location ${location}` : ''}).`,
         'AUTH_ERROR'
       );
     }
+
     const projectHtml = await projectPageRes.text();
-    const nextCsrf = extractCsrfToken(projectHtml);
-    if (nextCsrf) {
-      this.csrfToken = nextCsrf;
+    const nextCsrf = extractCsrfToken(projectHtml) ?? loginCsrf;
+
+    this.cookies.clear();
+    for (const [k, v] of stagedCookies) {
+      this.cookies.set(k, v);
     }
+    this.csrfToken = nextCsrf;
     this.authenticated = true;
   }
 
@@ -206,8 +234,8 @@ export class OverleafHttpClient {
 
     const method = (init.method ?? 'GET').toUpperCase();
     const headers = new Headers(init.headers);
-    const cookieHeader = this.getCookieHeader();
-    if (cookieHeader) headers.set('cookie', cookieHeader);
+    const sentCookieHeader = this.getCookieHeader();
+    if (sentCookieHeader) headers.set('cookie', sentCookieHeader);
     if (method !== 'GET' && method !== 'HEAD' && this.csrfToken && !headers.has('x-csrf-token')) {
       headers.set('x-csrf-token', this.csrfToken);
     }
@@ -218,12 +246,12 @@ export class OverleafHttpClient {
       headers,
       redirect: 'manual',
     });
-    this.updateCookies(res.headers);
+    applySetCookies(this.cookies, res.headers);
 
     const location = res.headers.get('location') ?? '';
     const isAuthRedirect = res.status >= 300 && res.status < 400 && location.includes('/login');
     if ((res.status === 401 || res.status === 403 || isAuthRedirect) && allowRetry) {
-      this.invalidateSession();
+      await this.reauthenticate(sentCookieHeader);
       return this.request(path, init, false);
     }
 
@@ -293,11 +321,14 @@ export class OverleafHttpClient {
 
   async compileProject(
     projectId: string,
-    options?: { rootDocId?: string }
+    options?: { rootDocId?: string; rootResourcePath?: string }
   ): Promise<CompileResult> {
     const body: Record<string, unknown> = { draft: false };
     if (options?.rootDocId) {
       body.rootDoc_id = options.rootDocId;
+    }
+    if (options?.rootResourcePath) {
+      body.rootResourcePath = options.rootResourcePath.replace(/^\//, '');
     }
 
     const res = await this.request(`/project/${encodeURIComponent(projectId)}/compile`, {

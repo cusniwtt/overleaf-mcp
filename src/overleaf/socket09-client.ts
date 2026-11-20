@@ -101,17 +101,144 @@ function decodeLatin1Utf8(text: string): string {
   return Buffer.from(text, 'latin1').toString('utf8');
 }
 
+function findFolder(
+  folders: OverleafFolderNode[],
+  folderId: string
+): OverleafFolderNode | undefined {
+  for (const folder of folders) {
+    if (folder._id === folderId) return folder;
+    if (folder.folders?.length) {
+      const nested = findFolder(folder.folders, folderId);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+type RemovedEntity =
+  | { kind: 'doc'; entity: OverleafDocRef }
+  | { kind: 'file'; entity: OverleafFileRef }
+  | { kind: 'folder'; entity: OverleafFolderNode };
+
+function removeEntityInFolders(
+  folders: OverleafFolderNode[],
+  entityId: string
+): RemovedEntity | undefined {
+  for (const folder of folders) {
+    if (folder.docs) {
+      const idx = folder.docs.findIndex((d) => d._id === entityId);
+      if (idx !== -1) {
+        return { kind: 'doc', entity: folder.docs.splice(idx, 1)[0] };
+      }
+    }
+    if (folder.fileRefs) {
+      const idx = folder.fileRefs.findIndex((f) => f._id === entityId);
+      if (idx !== -1) {
+        return { kind: 'file', entity: folder.fileRefs.splice(idx, 1)[0] };
+      }
+    }
+    if (folder.folders) {
+      const idx = folder.folders.findIndex((f) => f._id === entityId);
+      if (idx !== -1) {
+        return { kind: 'folder', entity: folder.folders.splice(idx, 1)[0] };
+      }
+      const nested = removeEntityInFolders(folder.folders, entityId);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+function renameEntityInFolders(
+  folders: OverleafFolderNode[],
+  entityId: string,
+  newName: string
+): boolean {
+  for (const folder of folders) {
+    if (folder._id === entityId) {
+      folder.name = newName;
+      return true;
+    }
+    const doc = folder.docs?.find((d) => d._id === entityId);
+    if (doc) {
+      doc.name = newName;
+      return true;
+    }
+    const file = folder.fileRefs?.find((f) => f._id === entityId);
+    if (file) {
+      file.name = newName;
+      return true;
+    }
+    if (folder.folders && renameEntityInFolders(folder.folders, entityId, newName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function addFolderToTree(
+  project: OverleafProjectPayload,
+  parentFolderId: string,
+  folder: OverleafFolderNode
+): void {
+  const parent = findFolder(project.rootFolder, parentFolderId);
+  if (!parent) return;
+  if (!parent.folders) parent.folders = [];
+  if (!parent.folders.some((f) => f._id === folder._id)) {
+    parent.folders.push({
+      _id: folder._id,
+      name: folder.name,
+      docs: folder.docs ?? [],
+      fileRefs: folder.fileRefs ?? [],
+      folders: folder.folders ?? [],
+    });
+  }
+}
+
+function addDocToTree(
+  project: OverleafProjectPayload,
+  parentFolderId: string,
+  doc: OverleafDocRef
+): void {
+  const parent = findFolder(project.rootFolder, parentFolderId);
+  if (!parent) return;
+  if (!parent.docs) parent.docs = [];
+  if (!parent.docs.some((d) => d._id === doc._id)) {
+    parent.docs.push({ _id: doc._id, name: doc.name });
+  }
+}
+
+function addFileToTree(
+  project: OverleafProjectPayload,
+  parentFolderId: string,
+  file: OverleafFileRef
+): void {
+  const parent = findFolder(project.rootFolder, parentFolderId);
+  if (!parent) return;
+  if (!parent.fileRefs) parent.fileRefs = [];
+  if (!parent.fileRefs.some((f) => f._id === file._id)) {
+    parent.fileRefs.push({ _id: file._id, name: file.name });
+  }
+}
+
 interface PendingAck {
   resolve: (args: unknown[]) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingOtResult {
+  resolve: (nextVersion: number) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 interface ProjectSession {
   ws: WebSocket;
-  projectPromise: Promise<OverleafProjectPayload>;
+  project: OverleafProjectPayload;
   nextId: number;
   pendingAcks: Map<number, PendingAck>;
+  pendingOtUpdates: Map<string, PendingOtResult[]>;
 }
 
 /**
@@ -122,6 +249,7 @@ export class OverleafRealtimeClient {
   private readonly httpClient: OverleafHttpClient;
   private readonly fetchImpl: typeof fetch;
   private readonly sessions = new Map<string, ProjectSession>();
+  private readonly connectingSessions = new Map<string, Promise<ProjectSession>>();
   private readonly ackTimeoutMs: number;
 
   constructor(
@@ -172,6 +300,7 @@ export class OverleafRealtimeClient {
     });
 
     const pendingAcks = new Map<number, PendingAck>();
+    const pendingOtUpdates = new Map<string, PendingOtResult[]>();
     let resolveProject!: (p: OverleafProjectPayload) => void;
     let rejectProject!: (err: Error) => void;
     let settled = false;
@@ -198,23 +327,73 @@ export class OverleafRealtimeClient {
       ws.close();
     }, this.ackTimeoutMs);
 
+    let sessionRef: ProjectSession | undefined;
+
     const failAll = (err: Error) => {
-      this.sessions.delete(projectId);
+      if (this.sessions.get(projectId) === sessionRef) {
+        this.sessions.delete(projectId);
+      }
       rejectProject(err);
       for (const [, pending] of pendingAcks) {
         clearTimeout(pending.timer);
         pending.reject(err);
       }
       pendingAcks.clear();
+      for (const [, queue] of pendingOtUpdates) {
+        for (const item of queue) {
+          clearTimeout(item.timer);
+          item.reject(err);
+        }
+      }
+      pendingOtUpdates.clear();
     };
 
-    const session: ProjectSession = {
-      ws,
-      projectPromise,
-      nextId: 1,
-      pendingAcks,
+    const handleTreeEvent = (name: string, args: unknown[]) => {
+      if (!sessionRef) return;
+      const proj = sessionRef.project;
+      switch (name) {
+        case 'reciveNewFolder': {
+          const [parentId, folder] = args as [string, OverleafFolderNode];
+          if (parentId && folder) addFolderToTree(proj, parentId, folder);
+          break;
+        }
+        case 'reciveNewDoc': {
+          const [parentId, doc] = args as [string, OverleafDocRef];
+          if (parentId && doc) addDocToTree(proj, parentId, doc);
+          break;
+        }
+        case 'reciveNewFile': {
+          const [parentId, file] = args as [string, OverleafFileRef];
+          if (parentId && file) addFileToTree(proj, parentId, file);
+          break;
+        }
+        case 'removeEntity': {
+          const [entityId] = args as [string];
+          if (entityId) removeEntityInFolders(proj.rootFolder, entityId);
+          break;
+        }
+        case 'reciveEntityRename': {
+          const [entityId, newName] = args as [string, string];
+          if (entityId && newName) renameEntityInFolders(proj.rootFolder, entityId, newName);
+          break;
+        }
+        case 'reciveEntityMove': {
+          const [entityId, toFolderId] = args as [string, string];
+          if (entityId && toFolderId) {
+            const removed = removeEntityInFolders(proj.rootFolder, entityId);
+            if (removed?.kind === 'doc') addDocToTree(proj, toFolderId, removed.entity);
+            else if (removed?.kind === 'file') addFileToTree(proj, toFolderId, removed.entity);
+            else if (removed?.kind === 'folder') addFolderToTree(proj, toFolderId, removed.entity);
+          }
+          break;
+        }
+        case 'setRootDoc': {
+          const [newRootDocId] = args as [string];
+          if (newRootDocId) proj.rootDoc_id = newRootDocId;
+          break;
+        }
+      }
     };
-    this.sessions.set(projectId, session);
 
     ws.on('message', (rawData) => {
       const text = typeof rawData === 'string' ? rawData : rawData.toString('utf8');
@@ -246,10 +425,50 @@ export class OverleafRealtimeClient {
         if (pkt.name === 'joinProjectResponse') {
           const payload = pkt.args[0] as { project?: OverleafProjectPayload } | undefined;
           if (payload?.project) {
+            sessionRef = {
+              ws,
+              project: payload.project,
+              nextId: 1,
+              pendingAcks,
+              pendingOtUpdates,
+            };
             resolveProject(payload.project);
           } else {
             failAll(new OverleafMcpError('joinProjectResponse missing project payload', 'REALTIME_ERROR'));
           }
+        } else if (pkt.name === 'otUpdateApplied') {
+          const applied = pkt.args[0] as { v?: number; doc?: string } | undefined;
+          const docId = applied?.doc;
+          if (docId) {
+            const queue = pendingOtUpdates.get(docId);
+            const item = queue?.shift();
+            if (queue && queue.length === 0) pendingOtUpdates.delete(docId);
+            if (item) {
+              clearTimeout(item.timer);
+              item.resolve((applied?.v ?? 0) + 1);
+            }
+          }
+        } else if (pkt.name === 'otUpdateError') {
+          const errArg = pkt.args[0];
+          const metaArg = pkt.args[1] as { doc_id?: string; error?: string } | undefined;
+          const errMsg =
+            typeof errArg === 'string'
+              ? errArg
+              : metaArg?.error ?? JSON.stringify(metaArg ?? errArg);
+          const otErr = new OverleafMcpError(`Overleaf OT update error: ${errMsg}`, 'OT_ERROR');
+          const docId = metaArg?.doc_id;
+          if (docId && pendingOtUpdates.has(docId)) {
+            const queue = pendingOtUpdates.get(docId)!;
+            const item = queue.shift();
+            if (queue.length === 0) pendingOtUpdates.delete(docId);
+            if (item) {
+              clearTimeout(item.timer);
+              item.reject(otErr);
+            }
+          } else {
+            failAll(otErr);
+          }
+          ws.close();
         } else if (pkt.name === 'connectionRejected') {
           const info = pkt.args[0] as { message?: string } | undefined;
           const msg = info?.message ?? 'connection rejected';
@@ -261,11 +480,8 @@ export class OverleafRealtimeClient {
         } else if (pkt.name === 'reconnectGracefully') {
           failAll(new OverleafMcpError('Overleaf requested graceful reconnect', 'REALTIME_DISCONNECTED'));
           ws.close();
-        } else if (pkt.name === 'otUpdateError') {
-          const errPayload = pkt.args[1] ?? pkt.args[0];
-          const errMsg = typeof errPayload === 'string' ? errPayload : JSON.stringify(errPayload);
-          failAll(new OverleafMcpError(`Overleaf OT update error: ${errMsg}`, 'OT_ERROR'));
-          ws.close();
+        } else {
+          handleTreeEvent(pkt.name, pkt.args);
         }
       }
     });
@@ -279,8 +495,9 @@ export class OverleafRealtimeClient {
     });
 
     try {
-      await session.projectPromise;
-      return session;
+      await projectPromise;
+      this.sessions.set(projectId, sessionRef!);
+      return sessionRef!;
     } catch (err) {
       if (
         allowReauth &&
@@ -297,11 +514,20 @@ export class OverleafRealtimeClient {
   private async getSession(projectId: string): Promise<ProjectSession> {
     const existing = this.sessions.get(projectId);
     if (existing && existing.ws.readyState !== WebSocket.CLOSED && existing.ws.readyState !== WebSocket.CLOSING) {
-      await existing.projectPromise;
       return existing;
     }
     this.sessions.delete(projectId);
-    return this.openSession(projectId);
+
+    const inflight = this.connectingSessions.get(projectId);
+    if (inflight) {
+      return inflight;
+    }
+
+    const connectPromise = this.openSession(projectId).finally(() => {
+      this.connectingSessions.delete(projectId);
+    });
+    this.connectingSessions.set(projectId, connectPromise);
+    return connectPromise;
   }
 
   private async emitWithAck(
@@ -330,7 +556,29 @@ export class OverleafRealtimeClient {
 
   async joinProject(projectId: string): Promise<OverleafProjectPayload> {
     const session = await this.getSession(projectId);
-    return session.projectPromise;
+    return session.project;
+  }
+
+  registerCreatedFolder(
+    projectId: string,
+    parentFolderId: string,
+    folder: { _id: string; name: string }
+  ): void {
+    const session = this.sessions.get(projectId);
+    if (session) {
+      addFolderToTree(session.project, parentFolderId, folder);
+    }
+  }
+
+  registerCreatedDoc(
+    projectId: string,
+    parentFolderId: string,
+    doc: { _id: string; name: string }
+  ): void {
+    const session = this.sessions.get(projectId);
+    if (session) {
+      addDocToTree(session.project, parentFolderId, doc);
+    }
   }
 
   async joinDoc(projectId: string, docId: string): Promise<JoinedDoc> {
@@ -368,21 +616,53 @@ export class OverleafRealtimeClient {
     projectId: string,
     docId: string,
     update: { v: number; op: OtOp[] }
-  ): Promise<void> {
+  ): Promise<number> {
     const session = await this.getSession(projectId);
-    const ack = await this.emitWithAck(session, 'applyOtUpdate', [
-      docId,
-      {
-        doc: docId,
-        v: update.v,
-        op: update.op,
-      },
-    ]);
-    const [err] = ack as [{ message?: string } | string | null];
-    if (err) {
-      const msg = typeof err === 'string' ? err : err.message ?? JSON.stringify(err);
-      throw new OverleafMcpError(`applyOtUpdate failed: ${msg}`, 'OT_ERROR');
+
+    let pendingEntry!: PendingOtResult;
+    const appliedPromise = new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const q = session.pendingOtUpdates.get(docId);
+        if (q) {
+          const idx = q.indexOf(pendingEntry);
+          if (idx !== -1) q.splice(idx, 1);
+          if (q.length === 0) session.pendingOtUpdates.delete(docId);
+        }
+        reject(new OverleafMcpError(`Timed out waiting for otUpdateApplied on ${docId}`, 'REALTIME_TIMEOUT'));
+      }, this.ackTimeoutMs);
+
+      pendingEntry = { resolve, reject, timer };
+      const q = session.pendingOtUpdates.get(docId) ?? [];
+      q.push(pendingEntry);
+      session.pendingOtUpdates.set(docId, q);
+    });
+
+    try {
+      const ack = await this.emitWithAck(session, 'applyOtUpdate', [
+        docId,
+        {
+          doc: docId,
+          v: update.v,
+          op: update.op,
+        },
+      ]);
+      const [err] = ack as [{ message?: string } | string | null];
+      if (err) {
+        const msg = typeof err === 'string' ? err : err.message ?? JSON.stringify(err);
+        throw new OverleafMcpError(`applyOtUpdate failed: ${msg}`, 'OT_ERROR');
+      }
+    } catch (err) {
+      clearTimeout(pendingEntry.timer);
+      const q = session.pendingOtUpdates.get(docId);
+      if (q) {
+        const idx = q.indexOf(pendingEntry);
+        if (idx !== -1) q.splice(idx, 1);
+        if (q.length === 0) session.pendingOtUpdates.delete(docId);
+      }
+      throw err;
     }
+
+    return appliedPromise;
   }
 
   close(projectId?: string): void {
