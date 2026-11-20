@@ -43,7 +43,7 @@ export type Socket09Packet =
   | { type: 5; id?: number; name: string; args: unknown[] }
   | { type: 6; ackId: number; args: unknown[] }
   | { type: 7; data: string }
-  | { type: number; raw: string };
+  | { type: 'unknown'; code: number; raw: string };
 
 export function encodeSocket09Event(name: string, args: unknown[], id?: number): string {
   const idPart = id !== undefined ? `${id}+` : '';
@@ -53,13 +53,13 @@ export function encodeSocket09Event(name: string, args: unknown[], id?: number):
 export function decodeSocket09Packet(raw: string): Socket09Packet {
   const firstColon = raw.indexOf(':');
   if (firstColon === -1) {
-    return { type: -1, raw };
+    return { type: 'unknown', code: -1, raw };
   }
   const type = Number(raw.slice(0, firstColon));
   const rest = raw.slice(firstColon + 1);
   const secondColon = rest.indexOf(':');
   if (secondColon === -1) {
-    return { type, raw };
+    return { type: 'unknown', code: type, raw };
   }
   const idStr = rest.slice(0, secondColon);
   const afterId = rest.slice(secondColon + 1);
@@ -94,7 +94,7 @@ export function decodeSocket09Packet(raw: string): Socket09Packet {
     return { type: 6, ackId, args };
   }
 
-  return { type, raw };
+  return { type: 'unknown', code: type, raw };
 }
 
 function decodeLatin1Utf8(text: string): string {
